@@ -53,7 +53,7 @@ static volatile short bandwidthEnabled = 0,
 
 static volatile LONG bandwidthLimit = BANDWIDTH_DEFAULT;
 static volatile LONG maxQueueSize = QUEUE_SIZE_DEFAULT;  // in KB
-static CRateStats *rateStats = NULL;
+static CRateStats *inboundStats = NULL, *outboundStats = NULL;
 
 
 static Ihandle* bandwidthSetupUI() {
@@ -169,8 +169,10 @@ static PacketNode* dequeuePacket() {
 static void bandwidthStartUp() {
     initQueue();
     startTimePeriod();
-    if (rateStats) crate_stats_delete(rateStats);
-    rateStats = crate_stats_new(1000, 1000);
+    if (inboundStats) crate_stats_delete(inboundStats);
+    if (outboundStats) crate_stats_delete(outboundStats);
+    inboundStats = crate_stats_new(1000, 1000);
+    outboundStats = crate_stats_new(1000, 1000);
     LOG("bandwidth enabled");
 }
 
@@ -182,8 +184,9 @@ static void bandwidthCloseDown(PacketNode *head, PacketNode *tail) {
         insertAfter(packet, head);
     }
     endTimePeriod();
-    if (rateStats) crate_stats_delete(rateStats);
-    rateStats = NULL;
+    if (inboundStats) crate_stats_delete(inboundStats);
+    if (outboundStats) crate_stats_delete(outboundStats);
+    inboundStats = outboundStats = NULL;
     LOG("bandwidth disabled");
 }
 
@@ -197,7 +200,7 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
     int limit = bandwidthLimit * 1024;
 
     //    allow 0 limit which should drop all
-    if (limit <= 0 || rateStats == NULL) {
+    if (limit < 0 || !inboundStats || !outboundStats) {
         return 0;
     }
 
@@ -206,19 +209,22 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
         while (head->next != tail) {
             PacketNode *pac = head->next;
             int discard = 0;
-            // chance in range of [0, 10000]
+
             if (checkDirection(pac->addr.Outbound, bandwidthInbound, bandwidthOutbound)) {
-                int rate = crate_stats_calculate(rateStats, now_ts);
+                CRateStats *stats = pac->addr.Outbound ? outboundStats : inboundStats;
+                int rate = crate_stats_calculate(stats, now_ts);
                 int size = pac->packetLen;
+
                 if (rate + size > limit) {
                     LOG("dropped with bandwidth %dKB/s, direction %s",
                         (int)bandwidthLimit, pac->addr.Outbound ? "OUTBOUND" : "INBOUND");
                     discard = 1;
                 }
                 else {
-                    crate_stats_update(rateStats, size, now_ts);
+                    crate_stats_update(stats, size, now_ts);
                 }
             }
+
             if (discard) {
                 freeNode(popNode(pac));
                 ++dropped;
@@ -246,17 +252,18 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
     }
 
     while (!isQueueEmpty()) {
-        int rate = crate_stats_calculate(rateStats, now_ts);
         PacketNode *queuedPacket = queueTail->prev;
-
+        CRateStats *stats = queuedPacket->addr.Outbound ? outboundStats : inboundStats;
+        int rate = crate_stats_calculate(stats, now_ts);
         int size = queuedPacket->packetLen;
+
         if (rate + size > limit) {
             break;
         }
 
         PacketNode *releasedPacket = dequeuePacket();
         insertAfter(releasedPacket, head);
-        crate_stats_update(rateStats, size, now_ts);
+        crate_stats_update(stats, size, now_ts);
     }
 
     return dropped > 0 || !isQueueEmpty();
