@@ -46,10 +46,11 @@ int32_t crate_stats_calculate(CRateStats *rate, uint32_t now_ts);
 //---------------------------------------------------------------------
 // configuration
 //---------------------------------------------------------------------
-static Ihandle *inboundCheckbox, *outboundCheckbox, *bandwidthInput, *queueSizeInput;
+static Ihandle *inboundCheckbox, *outboundCheckbox, *bandwidthInput, *queueSizeInput, *separateLimitsCheckbox;
 
 static volatile short bandwidthEnabled = 0,
-    bandwidthInbound = 1, bandwidthOutbound = 1;
+    bandwidthInbound = 1, bandwidthOutbound = 1,
+    separateDirectionLimits = 0;
 
 static volatile LONG bandwidthLimit = BANDWIDTH_DEFAULT;
 static volatile LONG maxQueueSize = QUEUE_SIZE_DEFAULT;  // in KB
@@ -58,6 +59,7 @@ static CRateStats *inboundStats = NULL, *outboundStats = NULL;
 
 static Ihandle* bandwidthSetupUI() {
     Ihandle *bandwidthControlsBox = IupHbox(
+        separateLimitsCheckbox = IupToggle("Separate In/Out Limits", NULL),
         IupLabel("Queue(KB):"),
         queueSizeInput = IupText(NULL),
         inboundCheckbox = IupToggle("Inbound", NULL),
@@ -93,11 +95,16 @@ static Ihandle* bandwidthSetupUI() {
     IupSetAttribute(inboundCheckbox, "VALUE", "ON");
     IupSetAttribute(outboundCheckbox, "VALUE", "ON");
 
+    // Separate limits checkbox setup
+    IupSetCallback(separateLimitsCheckbox, "ACTION", (Icallback)uiSyncToggle);
+    IupSetAttribute(separateLimitsCheckbox, SYNCED_VALUE, (char*)&separateDirectionLimits);
+
     if (parameterized) {
         setFromParameter(inboundCheckbox, "VALUE", NAME"-inbound");
         setFromParameter(outboundCheckbox, "VALUE", NAME"-outbound");
         setFromParameter(bandwidthInput, "VALUE", NAME"-bandwidth");
         setFromParameter(queueSizeInput, "VALUE", NAME"-queuesize");
+        setFromParameter(separateLimitsCheckbox, "VALUE", NAME"-separate");
     }
 
     return bandwidthControlsBox;
@@ -199,7 +206,7 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
     DWORD now_ts = timeGetTime();
     int limit = bandwidthLimit * 1024;
 
-    //    allow 0 limit which should drop all
+    // allow 0 limit which should drop all
     if (limit < 0 || !inboundStats || !outboundStats) {
         return 0;
     }
@@ -211,7 +218,7 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
             int discard = 0;
 
             if (checkDirection(pac->addr.Outbound, bandwidthInbound, bandwidthOutbound)) {
-                CRateStats *stats = pac->addr.Outbound ? outboundStats : inboundStats;
+                CRateStats *stats = (separateDirectionLimits && pac->addr.Outbound) ? outboundStats : inboundStats;
                 int rate = crate_stats_calculate(stats, now_ts);
                 int size = pac->packetLen;
 
@@ -251,9 +258,10 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
         }
     }
 
+    // Then process queue
     while (!isQueueEmpty()) {
         PacketNode *queuedPacket = queueTail->prev;
-        CRateStats *stats = queuedPacket->addr.Outbound ? outboundStats : inboundStats;
+        CRateStats *stats = (separateDirectionLimits && queuedPacket->addr.Outbound) ? outboundStats : inboundStats;
         int rate = crate_stats_calculate(stats, now_ts);
         int size = queuedPacket->packetLen;
 
