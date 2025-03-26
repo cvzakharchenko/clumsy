@@ -113,59 +113,72 @@ static Ihandle* bandwidthSetupUI() {
 //---------------------------------------------------------------------
 // queue implementation
 //---------------------------------------------------------------------
-static PacketNode queueHeadNode = {0}, queueTailNode = {0};
-static PacketNode *queueHead = &queueHeadNode, *queueTail = &queueTailNode;
-static LONG queueSize = 0;        // number of packets in queue
-static LONG queueDataSize = 0;    // total bytes in queue
+typedef struct {
+    PacketNode headNode;
+    PacketNode tailNode;
+    PacketNode *head;
+    PacketNode *tail;
+    LONG inboundDataSize;    // total bytes of inbound packets in queue
+    LONG outboundDataSize;   // total bytes of outbound packets in queue
+} PacketQueue;
 
-static INLINE_FUNCTION short isQueueEmpty() {
-    short ret = queueHead->next == queueTail;
-    if (ret) assert(queueSize == 0);
-    return ret;
+static PacketQueue queue = {
+    .headNode = {0},
+    .tailNode = {0},
+    .head = &queue.headNode,
+    .tail = &queue.tailNode,
+    .inboundDataSize = 0,
+    .outboundDataSize = 0
+};
+
+static INLINE_FUNCTION short isQueueEmpty(PacketQueue *q) {
+    return q->head->next == q->tail;
 }
 
-static void initQueue() {
-    if (queueHead->next == NULL && queueTail->next == NULL) {
-        queueHead->next = queueTail;
-        queueTail->prev = queueHead;
-        queueSize = 0;
-        queueDataSize = 0;
+static void initQueue(PacketQueue *q) {
+    if (q->head->next == NULL && q->tail->next == NULL) {
+        q->head->next = q->tail;
+        q->tail->prev = q->head;
+        q->inboundDataSize = 0;
+        q->outboundDataSize = 0;
     } else {
-        assert(isQueueEmpty());
+        assert(isQueueEmpty(q));
     }
 }
 
-static void clearQueue() {
-    LOG("Clearing bandwidth queue, dropping %d packets (%d bytes)", queueSize, queueDataSize);
-    while (!isQueueEmpty()) {
-        PacketNode *node = queueTail->prev;
+static void clearQueue(PacketQueue *q) {
+    LOG("Clearing bandwidth queue, dropping %d bytes (in: %d, out: %d)",
+        q->inboundDataSize + q->outboundDataSize, q->inboundDataSize, q->outboundDataSize);
+    while (!isQueueEmpty(q)) {
+        PacketNode *node = q->tail->prev;
         freeNode(popNode(node));
-        queueSize--;
     }
-    queueDataSize = 0;
+    q->inboundDataSize = 0;
+    q->outboundDataSize = 0;
 }
 
-static BOOL enqueuePacket(PacketNode *packet) {
+static BOOL enqueuePacket(PacketQueue *q, PacketNode *packet) {
     int size = packet->packetLen;
-    if (queueDataSize + size > maxQueueSize * 1024) {
-        LOG("Queue full (%d bytes), dropping packet", queueDataSize);
+    LONG *dataSize = packet->addr.Outbound ? &q->outboundDataSize : &q->inboundDataSize;
+
+    if (*dataSize + size > maxQueueSize * 1024) {
         return FALSE;
     }
 
-    insertAfter(packet, queueHead);
-    queueSize++;
-    queueDataSize += size;
+    insertAfter(packet, q->head);
+    *dataSize += size;
     return TRUE;
 }
 
-static PacketNode* dequeuePacket() {
-    if (isQueueEmpty()) {
+static PacketNode* dequeuePacket(PacketQueue *q) {
+    if (isQueueEmpty(q)) {
         return NULL;
     }
 
-    PacketNode *packet = popNode(queueTail->prev);
-    queueSize--;
-    queueDataSize -= packet->packetLen;
+    PacketNode *packet = popNode(q->tail->prev);
+    LONG *dataSize = packet->addr.Outbound ? &q->outboundDataSize : &q->inboundDataSize;
+    *dataSize -= packet->packetLen;
+
     return packet;
 }
 
@@ -174,7 +187,7 @@ static PacketNode* dequeuePacket() {
 //---------------------------------------------------------------------
 
 static void bandwidthStartUp() {
-    initQueue();
+    initQueue(&queue);
     startTimePeriod();
     if (inboundStats) crate_stats_delete(inboundStats);
     if (outboundStats) crate_stats_delete(outboundStats);
@@ -186,8 +199,8 @@ static void bandwidthStartUp() {
 static void bandwidthCloseDown(PacketNode *head, PacketNode *tail) {
     UNREFERENCED_PARAMETER(tail);
     // Release remaining packets before closing
-    while (!isQueueEmpty()) {
-        PacketNode *packet = dequeuePacket();
+    while (!isQueueEmpty(&queue)) {
+        PacketNode *packet = dequeuePacket(&queue);
         insertAfter(packet, head);
     }
     endTimePeriod();
@@ -251,16 +264,16 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
             continue;
         }
         PacketNode *node = popNode(pac);
-        if (!enqueuePacket(node)) {
-            LOG("Dropped packet: queue full (%d bytes)", queueDataSize);
+        if (!enqueuePacket(&queue, node)) {
+            LOG("Dropped packet: queue full");
             freeNode(node);
             dropped++;
         }
     }
 
     // Then process queue
-    while (!isQueueEmpty()) {
-        PacketNode *queuedPacket = queueTail->prev;
+    while (!isQueueEmpty(&queue)) {
+        PacketNode *queuedPacket = queue.tail->prev;
         CRateStats *stats = (separateDirectionLimits && queuedPacket->addr.Outbound) ? outboundStats : inboundStats;
         int rate = crate_stats_calculate(stats, now_ts);
         int size = queuedPacket->packetLen;
@@ -269,12 +282,12 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
             break;
         }
 
-        PacketNode *releasedPacket = dequeuePacket();
+        PacketNode *releasedPacket = dequeuePacket(&queue);
         insertAfter(releasedPacket, head);
         crate_stats_update(stats, size, now_ts);
     }
 
-    return dropped > 0 || !isQueueEmpty();
+    return dropped > 0 || !isQueueEmpty(&queue);
 }
 
 
