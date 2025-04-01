@@ -18,11 +18,17 @@ void initPacketNodeList() {
 //       just not sure I can write a better memory allocator
 PacketNode* createNode(char* buf, UINT len, WINDIVERT_ADDRESS *addr) {
     PacketNode *newNode = (PacketNode*)malloc(sizeof(PacketNode));
+
+    // Initialize the node
     newNode->packet = (char*)malloc(len);
     memcpy(newNode->packet, buf, len);
     newNode->packetLen = len;
     memcpy(&(newNode->addr), addr, sizeof(WINDIVERT_ADDRESS));
     newNode->next = newNode->prev = NULL;
+
+    // Parse transport 5-tuple from packet
+    parseTransportAddr(buf, len, &(newNode->transportAddr));
+
     return newNode;
 }
 

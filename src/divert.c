@@ -10,7 +10,7 @@
 // FIXME does this need to be larger then the time to process the list?
 #define CLOCK_WAITMS 40
 #define QUEUE_LEN 2 << 10
-#define QUEUE_TIME 2 << 9 
+#define QUEUE_TIME 2 << 9
 
 static HANDLE divertHandle;
 static volatile short stopLooping;
@@ -23,58 +23,80 @@ static DWORD divertClockLoop(LPVOID arg);
 extern PacketNode * const head;
 extern PacketNode * const tail;
 
-#ifdef _DEBUG
-PWINDIVERT_IPHDR dbg_ip_header;
-PWINDIVERT_IPV6HDR dbg_ipv6_header;
-PWINDIVERT_TCPHDR dbg_tcp_header;
-PWINDIVERT_UDPHDR dbg_udp_header;
-PWINDIVERT_ICMPHDR dbg_icmp_header;
-PWINDIVERT_ICMPV6HDR dbg_icmpv6_header;
-UINT payload_len;
-void dumpPacket(char *buf, int len, PWINDIVERT_ADDRESS paddr) {
-    char *protocol;
-    UINT16 srcPort = 0, dstPort = 0;
+// Extract connection 5-tuple from packet
+void parseTransportAddr(char *buf, int len, TransportAddr *outAddr) {
+    PWINDIVERT_IPHDR ip_header = NULL;
+    PWINDIVERT_IPV6HDR ipv6_header = NULL;
+    PWINDIVERT_TCPHDR tcp_header = NULL;
+    PWINDIVERT_UDPHDR udp_header = NULL;
+    PWINDIVERT_ICMPHDR icmp_header = NULL;
+    PWINDIVERT_ICMPV6HDR icmpv6_header = NULL;
+    UINT8 protocol = 0;
 
-    WinDivertHelperParsePacket(buf, len, &dbg_ip_header, &dbg_ipv6_header, NULL,
-        &dbg_icmp_header, &dbg_icmpv6_header, &dbg_tcp_header, &dbg_udp_header,
-        NULL, &payload_len, NULL, NULL);
-    // need to cast byte order on port numbers
-    if (dbg_tcp_header != NULL) {
-        protocol = "TCP ";
-        srcPort = ntohs(dbg_tcp_header->SrcPort);
-        dstPort = ntohs(dbg_tcp_header->DstPort);
-    } else if (dbg_udp_header != NULL) {
-        protocol = "UDP ";
-        srcPort = ntohs(dbg_udp_header->SrcPort);
-        dstPort = ntohs(dbg_udp_header->DstPort);
-    } else if (dbg_icmp_header || dbg_icmpv6_header) {
-        protocol = "ICMP";
-    } else {
-        protocol = "???";
+    memset(outAddr, 0, sizeof(TransportAddr));
+
+    // Parse the packet to extract protocol, addresses and ports
+    WinDivertHelperParsePacket(
+        buf, len,
+        &ip_header, &ipv6_header, &protocol,
+        &icmp_header, &icmpv6_header,
+        &tcp_header, &udp_header,
+        NULL, NULL, NULL, NULL);
+
+    outAddr->protocol = protocol;
+
+    if (ip_header) {
+        outAddr->ipv6 = 0;
+        outAddr->srcAddr[0] = ip_header->SrcAddr;
+        outAddr->dstAddr[0] = ip_header->DstAddr;
+    } else if (ipv6_header) {
+        outAddr->ipv6 = 1;
+        memcpy(outAddr->srcAddr, ipv6_header->SrcAddr, sizeof(UINT32) * 4);
+        memcpy(outAddr->dstAddr, ipv6_header->DstAddr, sizeof(UINT32) * 4);
     }
 
-    if (dbg_ip_header != NULL) {
-        UINT8 *src_addr = (UINT8*)&dbg_ip_header->SrcAddr;
-        UINT8 *dst_addr = (UINT8*)&dbg_ip_header->DstAddr;
-        LOG("%s.%s: %u.%u.%u.%u:%d->%u.%u.%u.%u:%d",
-            protocol,
-            paddr->Outbound ? "OUT " : "IN  ",
-            src_addr[0], src_addr[1], src_addr[2], src_addr[3], srcPort,
-            dst_addr[0], dst_addr[1], dst_addr[2], dst_addr[3], dstPort);
-    } else if (dbg_ipv6_header != NULL) {
-        UINT16 *src_addr6 = (UINT16*)&dbg_ipv6_header->SrcAddr;
-        UINT16 *dst_addr6 = (UINT16*)&dbg_ipv6_header->DstAddr;
-        LOG("%s.%s: %x:%x:%x:%x:%x:%x:%x:%x:%d->%x:%x:%x:%x:%x:%x:%x:%x:%d",
-            protocol,
-            paddr->Outbound ? "OUT " : "IN  ",
-            src_addr6[0], src_addr6[1], src_addr6[2], src_addr6[3],
-            src_addr6[4], src_addr6[5], src_addr6[6], src_addr6[7], srcPort,
-            dst_addr6[0], dst_addr6[1], dst_addr6[2], dst_addr6[3],
-            dst_addr6[4], dst_addr6[5], dst_addr6[6], dst_addr6[7], dstPort);
+    if (tcp_header) {
+        outAddr->srcPort = ntohs(tcp_header->SrcPort);
+        outAddr->dstPort = ntohs(tcp_header->DstPort);
+    } else if (udp_header) {
+        outAddr->srcPort = ntohs(udp_header->SrcPort);
+        outAddr->dstPort = ntohs(udp_header->DstPort);
+    }
+    // For ICMP, ports remain 0
+}
+
+#ifdef _DEBUG
+const char* getProtocolName(UINT8 protocol) {
+    switch (protocol) {
+        case IPPROTO_TCP:
+            return "TCP";
+        case IPPROTO_UDP:
+            return "UDP";
+        case IPPROTO_ICMP:
+            return "ICMP";
+        case IPPROTO_ICMPV6:
+            return "ICMPv6";
+        default:
+            return "???";
     }
 }
-#else
-#define dumpPacket(x, y, z)
+
+void dumpTransportAddr(const TransportAddr *transportAddr) {
+    const char* protocol = getProtocolName(transportAddr->protocol);
+
+    char srcAddrStr[46]; // Max IPv6 string length
+    char dstAddrStr[46];
+
+    if (transportAddr->ipv6) {
+        WinDivertHelperFormatIPv6Address(transportAddr->srcAddr, srcAddrStr, sizeof(srcAddrStr));
+        WinDivertHelperFormatIPv6Address(transportAddr->dstAddr, dstAddrStr, sizeof(dstAddrStr));
+    } else {
+        WinDivertHelperFormatIPv4Address(transportAddr->srcAddr[0], srcAddrStr, sizeof(srcAddrStr));
+        WinDivertHelperFormatIPv4Address(transportAddr->dstAddr[0], dstAddrStr, sizeof(dstAddrStr));
+    }
+
+    LOG("%s: %s:%d->%s:%d", protocol, srcAddrStr, transportAddr->srcPort, dstAddrStr, transportAddr->dstPort);
+}
 #endif
 
 int divertStart(const char *filter, char buf[]) {
@@ -157,7 +179,7 @@ static int sendAllListPackets() {
             PWINDIVERT_IPHDR ip_header;
             PWINDIVERT_IPV6HDR ipv6_header;
             LOG("Failed to send a packet. (%lu)", GetLastError());
-            dumpPacket(pnode->packet, pnode->packetLen, &(pnode->addr));
+            dumpTransportAddr(&(pnode->transportAddr));
             // as noted in windivert help, reinject inbound icmp packets some times would fail
             // workaround this by resend them as outbound
             // TODO not sure is this even working as can't find a way to test
@@ -296,7 +318,7 @@ static DWORD divertClockLoop(LPVOID arg) {
                     Module *module = modules[ix];
                     if (*(module->enabledFlag)) {
                         module->closeDown(head, tail);
-                    } 
+                    }
                 }
                 LOG("Send all packets upon closing");
                 lastSendCount = sendAllListPackets();
@@ -343,10 +365,8 @@ static DWORD divertReadLoop(LPVOID arg) {
         }
         if (readLen > MAX_PACKETSIZE) {
             // don't know how this can happen
-            LOG("Internal Error: DivertRecv truncated recv packet."); 
+            LOG("Internal Error: DivertRecv truncated recv packet.");
         }
-
-        //dumpPacket(packetBuf, readLen, &addrBuf);  
 
         waitResult = WaitForSingleObject(mutex, INFINITE);
         switch(waitResult) {

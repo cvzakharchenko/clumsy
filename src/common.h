@@ -92,11 +92,23 @@ static void VsLog(const char* pFmt, ...)
 //#define assert(x)
 #endif
 
+typedef struct {
+    UINT8 ipv6; // 1 for IPv6, 0 for IPv4
+
+    // 5-tuple
+    UINT8 protocol; // TCP, UDP, ICMP, etc.
+    UINT32 srcAddr[4]; // IPv4 uses only the first element
+    UINT16 srcPort;
+    UINT32 dstAddr[4]; // IPv4 uses only the first element
+    UINT16 dstPort;
+} TransportAddr;
+
 // package node
 typedef struct _NODE {
     char *packet;
     UINT packetLen;
     WINDIVERT_ADDRESS addr;
+    TransportAddr transportAddr; // 5-tuple + ipv6 flag
     DWORD timestamp; // ! timestamp isn't filled when creating node since it's only needed for lag
     struct _NODE *prev, *next;
 } PacketNode;
@@ -134,7 +146,7 @@ typedef struct {
      * Flags used during program excution. Need to be re initialized on each run
      */
     short lastEnabled; // if it is enabled on last run
-    short processTriggered; // whether this module has been triggered in last step 
+    short processTriggered; // whether this module has been triggered in last step
     Ihandle *iconHandle; // store the icon to be updated
 } Module;
 
@@ -148,7 +160,7 @@ extern Module resetModule;
 extern Module bandwidthModule;
 extern Module* modules[MODULE_CNT]; // all modules in a list
 
-// status for sending packets, 
+// status for sending packets,
 #define SEND_STATUS_NONE 0
 #define SEND_STATUS_SEND 1
 #define SEND_STATUS_FAIL -1
@@ -161,6 +173,7 @@ void showStatus(const char* line);
 // WinDivert
 int divertStart(const char * filter, char buf[]);
 void divertStop();
+void parseTransportAddr(char *buf, int len, TransportAddr *transportAddr);
 
 // utils
 // STR to convert int macro to string
