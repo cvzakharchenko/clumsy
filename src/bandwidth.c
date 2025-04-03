@@ -14,6 +14,8 @@
 #define QUEUE_SIZE_MIN "0"
 #define QUEUE_SIZE_MAX "1024"   // 1MB
 #define QUEUE_SIZE_DEFAULT 0    // Default to old algorithm
+#define MAX_QUEUES 1000
+#define QUEUE_UNUSED_TIMEOUT 10000
 
 //---------------------------------------------------------------------
 // rate stats
@@ -125,33 +127,13 @@ typedef struct {
     PacketNode *head;
     PacketNode *tail;
     LONG dataSize;    // total bytes of packets in queue
+    TransportAddr transportAddr;
+    uint32_t lastUsed;
     TokenBucket bucket;
 } PacketQueue;
 
-static PacketQueue queue[2] = {{
-    // Inbound
-    .headNode = {0},
-    .tailNode = {0},
-    .head = &queue[0].headNode,
-    .tail = &queue[0].tailNode,
-    .dataSize = 0,
-    .bucket = {
-        .tokensAvailable = 0,
-        .lastRefill = 0,
-    }
-},
-{
-    // Outbound
-    .headNode = {0},
-    .tailNode = {0},
-    .head = &queue[1].headNode,
-    .tail = &queue[1].tailNode,
-    .dataSize = 0,
-    .bucket = {
-        .tokensAvailable = 0,
-        .lastRefill = 0,
-    }
-}};
+static PacketQueue queues[MAX_QUEUES] = {0};
+static int firstInactiveQueue = 0;
 
 static INLINE_FUNCTION short isQueueEmpty(PacketQueue *q) {
     return q->head->next == q->tail;
@@ -161,7 +143,6 @@ static void initQueue(PacketQueue *q) {
     if (q->head->next == NULL && q->tail->next == NULL) {
         q->head->next = q->tail;
         q->tail->prev = q->head;
-        q->dataSize = 0;
     } else {
         assert(isQueueEmpty(q));
     }
@@ -197,6 +178,11 @@ static PacketNode* dequeuePacket(PacketQueue *q) {
     return packet;
 }
 
+void resetTokenBucket(TokenBucket* bucket, uint32_t nowTs, uint32_t tokenBucketMaxSize) {
+    bucket->tokensAvailable = (double)tokenBucketMaxSize;
+    bucket->lastRefill = nowTs;
+}
+
 BOOL trySpendTokens(TokenBucket* bucket, uint32_t nowTs, uint32_t bandwidthBps, uint32_t tokenBucketMaxSize, uint32_t tokensToSpend) {
     assert(bucket != NULL);
 
@@ -213,14 +199,51 @@ BOOL trySpendTokens(TokenBucket* bucket, uint32_t nowTs, uint32_t bandwidthBps, 
     }
 }
 
+static PacketQueue* findOrCreateQueue(TransportAddr *addr, uint32_t nowTs, uint32_t tokenBucketMaxSize) {
+    for (int i = 0; i < firstInactiveQueue; i++) {
+        if (memcmp(addr, &queues[i].transportAddr, sizeof(TransportAddr)) == 0) {
+            queues[i].lastUsed = nowTs;
+            return &queues[i];
+        }
+    }
+
+    PacketQueue *queue = NULL;
+
+    for (int i = 0; i < firstInactiveQueue; i++) {
+        if (isQueueEmpty(&queues[i]) && nowTs - queues[i].lastUsed > QUEUE_UNUSED_TIMEOUT) {
+            queue = &queues[i];
+            break;
+        }
+    }
+
+    if (queue == NULL) {
+        if (firstInactiveQueue < MAX_QUEUES) {
+            queue = &queues[firstInactiveQueue++];
+        }
+        else {
+            LOG("Bandwidth queue overflow");
+            return NULL;
+        }
+    }
+
+    queue->lastUsed = nowTs;
+    memcpy(&queue->transportAddr, addr, sizeof(TransportAddr));
+    resetTokenBucket(&queue->bucket, nowTs, tokenBucketMaxSize);
+    assert(queue->dataSize == 0);
+
+    return queue;
+}
+
 //---------------------------------------------------------------------
 // start up and close down
 //---------------------------------------------------------------------
 
 static void bandwidthStartUp() {
     startTimePeriod();
+    for (int i = 0; i < MAX_QUEUES; i++) {
+        initQueue(&queues[i]);
+    }
     for (int i = 0; i < 2; i++) {
-        initQueue(&queue[i]);
         if (rateStats[i]) crate_stats_delete(rateStats[i]);
         rateStats[i] = crate_stats_new(1000, 1000);
     }
@@ -230,11 +253,13 @@ static void bandwidthStartUp() {
 static void bandwidthCloseDown(PacketNode *head, PacketNode *tail) {
     UNREFERENCED_PARAMETER(tail);
     // Release remaining packets before closing
-    for (int i = 0; i < 2; i++) {
-        while (!isQueueEmpty(&queue[i])) {
-            PacketNode *packet = dequeuePacket(&queue[i]);
+    for (int i = 0; i < MAX_QUEUES; i++) {
+        while (!isQueueEmpty(&queues[i])) {
+            PacketNode *packet = dequeuePacket(&queues[i]);
             insertAfter(packet, head);
         }
+    }
+    for (int i = 0; i < 2; i++) {
         if (rateStats[i]) crate_stats_delete(rateStats[i]);
         rateStats[i] = NULL;
     }
@@ -290,11 +315,6 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
 
     // Queue-based algorithm when queue size > 0
 
-    // Clear queue[1] to avoid old packets when switching back to separate limit
-    if (!separateLimit && !isQueueEmpty(&queue[1])) {
-        clearQueue(&queue[1]);
-    }
-
     // Enqueue all packets, or drop if queue is full
     while (tail->prev != head) {
         PacketNode *pac = tail->prev;
@@ -303,24 +323,25 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
             continue;
         }
 
-        PacketQueue *targetQueue = &queue[separateLimit && pac->addr.Outbound];
         popNode(pac);
 
-        if (!enqueuePacket(targetQueue, pac)) {
+        PacketQueue *targetQueue = findOrCreateQueue(&pac->transportAddr, now_ts, limit);
+        if (!targetQueue || !enqueuePacket(targetQueue, pac)) {
             LOG("Dropped packet: queue full");
             freeNode(pac);
             dropped++;
         }
     }
 
+    int queuesNotEmpty = 0;
     // Process as many packets as possible within the limit
-    for (int direction = 0; direction <= separateLimit; direction++) {
-        PacketQueue *targetQueue = &queue[direction];
-
+    for (int i = 0; i < firstInactiveQueue; i++) {
+        PacketQueue *targetQueue = &queues[i];
         while (!isQueueEmpty(targetQueue)) {
             PacketNode *queuedPacket = targetQueue->tail->prev;
             int size = queuedPacket->packetLen;
             if (!trySpendTokens(&targetQueue->bucket, now_ts, limit, limit, size)) {
+                queuesNotEmpty++;
                 break;
             }
 
@@ -329,7 +350,7 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
         }
     }
 
-    return dropped > 0 || !isQueueEmpty(&queue[0]) || !isQueueEmpty(&queue[1]);
+    return dropped > 0 || queuesNotEmpty > 0;
 }
 
 
