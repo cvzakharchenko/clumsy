@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <Windows.h>
 #include <stdint.h>
+#include <math.h>
 
 #include "iup.h"
 #include "common.h"
@@ -114,11 +115,17 @@ static Ihandle* bandwidthSetupUI() {
 // queue implementation
 //---------------------------------------------------------------------
 typedef struct {
+    double tokensAvailable;
+    uint32_t lastRefill;
+} TokenBucket;
+
+typedef struct {
     PacketNode headNode;
     PacketNode tailNode;
     PacketNode *head;
     PacketNode *tail;
     LONG dataSize;    // total bytes of packets in queue
+    TokenBucket bucket;
 } PacketQueue;
 
 static PacketQueue queue[2] = {{
@@ -127,7 +134,11 @@ static PacketQueue queue[2] = {{
     .tailNode = {0},
     .head = &queue[0].headNode,
     .tail = &queue[0].tailNode,
-    .dataSize = 0
+    .dataSize = 0,
+    .bucket = {
+        .tokensAvailable = 0,
+        .lastRefill = 0,
+    }
 },
 {
     // Outbound
@@ -135,8 +146,12 @@ static PacketQueue queue[2] = {{
     .tailNode = {0},
     .head = &queue[1].headNode,
     .tail = &queue[1].tailNode,
-    .dataSize = 0
-}};;
+    .dataSize = 0,
+    .bucket = {
+        .tokensAvailable = 0,
+        .lastRefill = 0,
+    }
+}};
 
 static INLINE_FUNCTION short isQueueEmpty(PacketQueue *q) {
     return q->head->next == q->tail;
@@ -180,6 +195,22 @@ static PacketNode* dequeuePacket(PacketQueue *q) {
     PacketNode *packet = popNode(q->tail->prev);
     q->dataSize -= packet->packetLen;
     return packet;
+}
+
+BOOL trySpendTokens(TokenBucket* bucket, uint32_t nowTs, uint32_t bandwidthBps, uint32_t tokenBucketMaxSize, uint32_t tokensToSpend) {
+    assert(bucket != NULL);
+
+    uint32_t deltaTs = nowTs - bucket->lastRefill; // Timestamp wrap-around is handled by unsigned arithmetic
+    double tokensToAdd = (double)deltaTs * (double)bandwidthBps / 1000.0;
+    bucket->tokensAvailable = fmin((double)tokenBucketMaxSize, bucket->tokensAvailable + tokensToAdd);
+    bucket->lastRefill = nowTs;
+
+    if (bucket->tokensAvailable >= (double)tokensToSpend) {
+        bucket->tokensAvailable -= (double)tokensToSpend;
+        return 1; // Successfully spent tokens
+    } else {
+        return 0; // Not enough tokens
+    }
 }
 
 //---------------------------------------------------------------------
@@ -285,20 +316,16 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
     // Process as many packets as possible within the limit
     for (int direction = 0; direction <= separateLimit; direction++) {
         PacketQueue *targetQueue = &queue[direction];
-        CRateStats *stats = rateStats[direction];
 
         while (!isQueueEmpty(targetQueue)) {
             PacketNode *queuedPacket = targetQueue->tail->prev;
-            int rate = crate_stats_calculate(stats, now_ts);
             int size = queuedPacket->packetLen;
-
-            if (rate + size > limit) {
+            if (!trySpendTokens(&targetQueue->bucket, now_ts, limit, limit, size)) {
                 break;
             }
 
             PacketNode *releasedPacket = dequeuePacket(targetQueue);
             insertAfter(releasedPacket, head);
-            crate_stats_update(stats, size, now_ts);
         }
     }
 

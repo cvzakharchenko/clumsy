@@ -97,6 +97,8 @@ void dumpTransportAddr(const TransportAddr *transportAddr) {
 
     LOG("%s: %s:%d->%s:%d", protocol, srcAddrStr, transportAddr->srcPort, dstAddrStr, transportAddr->dstPort);
 }
+#else
+#define dumpTransportAddr(x)
 #endif
 
 int divertStart(const char *filter, char buf[]) {
