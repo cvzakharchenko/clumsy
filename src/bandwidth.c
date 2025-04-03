@@ -140,6 +140,9 @@ static INLINE_FUNCTION short isQueueEmpty(PacketQueue *q) {
 }
 
 static void initQueue(PacketQueue *q) {
+    q->head = &q->headNode;
+    q->tail = &q->tailNode;
+
     if (q->head->next == NULL && q->tail->next == NULL) {
         q->head->next = q->tail;
         q->tail->prev = q->head;
