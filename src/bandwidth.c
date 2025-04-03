@@ -181,6 +181,7 @@ static PacketNode* dequeuePacket(PacketQueue *q) {
     return packet;
 }
 
+// We always need it because of potential timer wrap around. Without it, bucket doesn't need to be reset
 void resetTokenBucket(TokenBucket* bucket, uint32_t nowTs, uint32_t tokenBucketMaxSize) {
     bucket->tokensAvailable = (double)tokenBucketMaxSize;
     bucket->lastRefill = nowTs;
@@ -202,9 +203,16 @@ BOOL trySpendTokens(TokenBucket* bucket, uint32_t nowTs, uint32_t bandwidthBps, 
     }
 }
 
+static BOOL queueExpired(PacketQueue *q, uint32_t nowTs) {
+    return nowTs - q->lastUsed > QUEUE_UNUSED_TIMEOUT;
+}
+
 static PacketQueue* findOrCreateQueue(TransportAddr *addr, uint32_t nowTs, uint32_t tokenBucketMaxSize) {
     for (int i = 0; i < firstInactiveQueue; i++) {
         if (memcmp(addr, &queues[i].transportAddr, sizeof(TransportAddr)) == 0) {
+            if (queueExpired(&queues[i], nowTs)) {
+                resetTokenBucket(&queues[i].bucket, nowTs, tokenBucketMaxSize);
+            }
             queues[i].lastUsed = nowTs;
             return &queues[i];
         }
@@ -213,7 +221,7 @@ static PacketQueue* findOrCreateQueue(TransportAddr *addr, uint32_t nowTs, uint3
     PacketQueue *queue = NULL;
 
     for (int i = 0; i < firstInactiveQueue; i++) {
-        if (isQueueEmpty(&queues[i]) && nowTs - queues[i].lastUsed > QUEUE_UNUSED_TIMEOUT) {
+        if (isQueueEmpty(&queues[i]) && queueExpired(&queues[i], nowTs)) {
             queue = &queues[i];
             break;
         }
